@@ -1,0 +1,21 @@
+[package]
+name = "wisp-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "nyx-server"
+path = "src/main.rs"
+
+[dependencies]
+wisp-core = { path = "../wisp-core" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+rand = "0.8"
+clap = { version = "4", features = ["derive"] }
+ed25519-dalek = "2"
+sha2 = "0.10"
+hex = "0.4"
+thiserror = "1"

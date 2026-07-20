@@ -1,0 +1,9 @@
+[package]
+name = "wisp-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Wisp protocol v2 frame types, codec, and state machines"
+
+[dependencies]
+thiserror = "1"
