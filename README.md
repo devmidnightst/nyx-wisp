@@ -16,7 +16,7 @@ Binaries end up at `target/release/nyx-server` and `target/release/nyx-client`.
 
 ## test
 
-    cargo test -p wisp-core
+    cargo test
 
 ## running it
 

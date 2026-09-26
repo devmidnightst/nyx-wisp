@@ -65,6 +65,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+// the handshake callback's error type is fixed by tungstenite, so its size isn't ours to shrink
+#[allow(clippy::result_large_err)]
 async fn handle_connection(
     socket: TcpStream,
     buffer_size: u32,
