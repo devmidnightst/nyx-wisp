@@ -90,7 +90,7 @@ where
 {
     let has_protocol_header = Arc::new(AtomicBool::new(false));
     let flag = has_protocol_header.clone();
-    let ws = tokio_tungstenite::accept_hdr_async(stream, move |req: &Request, mut resp: Response| {
+    let callback = move |req: &Request, mut resp: Response| {
         if let Some(requested) = req.headers().get("sec-websocket-protocol") {
             flag.store(true, Ordering::SeqCst);
             if let Some(first) = first_subprotocol(requested) {
@@ -98,8 +98,8 @@ where
             }
         }
         Ok(resp)
-    })
-    .await?;
+    };
+    let ws = tokio_tungstenite::accept_hdr_async_with_config(stream, callback, Some(crate::websocket_config())).await?;
 
     if has_protocol_header.load(Ordering::SeqCst) {
         serve_v2(ws, &config).await

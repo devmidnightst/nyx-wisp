@@ -21,6 +21,21 @@ Binaries end up at `target/release/nyx-server` and `target/release/nyx-client`.
 
 CI runs build, clippy (warnings denied) and the full test suite on every push to main and every pull request.
 
+## benchmark
+
+    cargo run --release -p wisp-tokio --example bench
+
+Runs a server and a client in one process against a local TCP echo server, and prints throughput and latency. Set `BENCH_SCALE` to multiply the amount of data. On a 4 core VM:
+
+| | |
+|---|---|
+| single stream echo | ~530 MiB/s |
+| 16 streams echo, total | ~1000 MiB/s |
+| 64 byte round trip | ~61 us p50, ~125 us p99 |
+| open a stream + echo 1 byte | ~5300 streams/s |
+
+Echo throughput counts each byte once, even though it crosses both the websocket and the upstream socket in each direction.
+
 ## running it
 
 Start a server:
@@ -68,13 +83,17 @@ When both auth methods are enabled, either one is enough.
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wisp_tokio::client::{self, ClientConfig, ClientMux};
 
-let (ws, _) = tokio_tungstenite::connect_async(client::request("ws://127.0.0.1:9000/")?).await?;
+let request = client::request("ws://127.0.0.1:9000/")?;
+let config = Some(wisp_tokio::websocket_config());
+let (ws, _) = tokio_tungstenite::connect_async_with_config(request, config, false).await?;
 let mux = ClientMux::new(ws, ClientConfig::default()).await?;
 let mut stream = mux.open_tcp("example.com", 80).await?;
 stream.write_all(b"GET / HTTP/1.0\r\nHost: example.com\r\n\r\n").await?;
 let mut response = Vec::new();
 stream.read_to_end(&mut response).await?;
 ```
+
+`websocket_config()` is optional but recommended: it sizes tungstenite's read buffer for wisp's mostly small frames, which lowers latency.
 
 Serving is one call per accepted socket:
 

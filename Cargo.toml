@@ -6,3 +6,7 @@ members = ["wisp-core", "wisp-tokio", "wisp-server", "wisp-client"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1

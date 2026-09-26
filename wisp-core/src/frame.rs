@@ -20,6 +20,13 @@ impl Frame {
         out
     }
 
+    /// The 5 byte header of a DATA frame. Writing this followed by the payload produces the same
+    /// bytes as encoding a `Packet::Data` frame, without building the packet first.
+    pub fn data_header(stream_id: u32) -> [u8; 5] {
+        let id = stream_id.to_le_bytes();
+        [PacketType::Data.as_u8(), id[0], id[1], id[2], id[3]]
+    }
+
     pub fn decode(buf: &[u8]) -> Result<Frame> {
         if buf.len() < 5 {
             return Err(WispError::PacketTooShort {
@@ -90,6 +97,14 @@ mod tests {
             let decoded = Frame::decode(&encoded).unwrap();
             assert_eq!(decoded, frame);
         }
+    }
+
+    #[test]
+    fn data_header_matches_encoded_data_frame() {
+        let frame = Frame::new(0xdeadbeef, Packet::Data { payload: b"abc".to_vec() });
+        let mut manual = Frame::data_header(0xdeadbeef).to_vec();
+        manual.extend_from_slice(b"abc");
+        assert_eq!(manual, frame.encode());
     }
 
     #[test]

@@ -6,7 +6,9 @@
 //! use tokio::io::{AsyncReadExt, AsyncWriteExt};
 //! use wisp_tokio::client::{self, ClientConfig, ClientMux};
 //!
-//! let (ws, _) = tokio_tungstenite::connect_async(client::request("ws://127.0.0.1:9000/")?).await?;
+//! let request = client::request("ws://127.0.0.1:9000/")?;
+//! let config = Some(wisp_tokio::websocket_config());
+//! let (ws, _) = tokio_tungstenite::connect_async_with_config(request, config, false).await?;
 //! let mux = ClientMux::new(ws, ClientConfig::default()).await?;
 //! let mut stream = mux.open_tcp("example.com", 80).await?;
 //! stream.write_all(b"GET / HTTP/1.0\r\nHost: example.com\r\n\r\n").await?;
@@ -36,10 +38,11 @@ use tokio_tungstenite::WebSocketStream;
 use wisp_core::{CloseReason, Frame, Packet, StreamType, WispVersion};
 
 use crate::error::{Error, Result};
+use crate::ws::{frame_message, Outgoing};
 
 pub use stream::WispStream;
 
-use driver::{Command, FlowState, StreamSlot};
+use driver::{FlowState, StreamSlot};
 
 /// Frames queued for the websocket before `open` and stream writes start waiting.
 const OUTBOUND_CAPACITY: usize = 256;
@@ -139,8 +142,8 @@ impl Shared {
 pub struct ClientMux {
     info: Arc<ServerInfo>,
     shared: Arc<Shared>,
-    out_tx: mpsc::Sender<Command>,
-    ctrl_tx: mpsc::UnboundedSender<Command>,
+    out_tx: mpsc::Sender<Outgoing>,
+    ctrl_tx: mpsc::UnboundedSender<Outgoing>,
 }
 
 impl ClientMux {
@@ -243,7 +246,7 @@ impl ClientMux {
                 destination_hostname: host.into(),
             },
         );
-        if self.out_tx.send(Command::Frame(connect)).await.is_err() {
+        if self.out_tx.send(Outgoing::Message(frame_message(&connect))).await.is_err() {
             self.shared.remove_stream(stream_id, token);
             return Err(Error::MuxClosed);
         }
@@ -272,7 +275,7 @@ impl ClientMux {
 
     /// Closes the websocket. Open streams see the connection end on their next read or write.
     pub fn close(&self) {
-        let _ = self.ctrl_tx.send(Command::Shutdown);
+        let _ = self.ctrl_tx.send(Outgoing::Shutdown);
     }
 }
 

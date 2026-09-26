@@ -38,7 +38,8 @@ async fn start_server(config: ServerConfig) -> SocketAddr {
 
 async fn connect(addr: SocketAddr, config: ClientConfig) -> Result<ClientMux, Error> {
     let request = client::request(&format!("ws://{addr}/")).unwrap();
-    let (ws, _) = tokio_tungstenite::connect_async(request).await?;
+    let (ws, _) =
+        tokio_tungstenite::connect_async_with_config(request, Some(wisp_tokio::websocket_config()), false).await?;
     ClientMux::new(ws, config).await
 }
 
@@ -445,12 +446,47 @@ async fn v1_clients_are_served_without_an_info_exchange() {
             destination_hostname: "127.0.0.1".into(),
         },
     );
-    ws.send(Message::Binary(connect.encode())).await.unwrap();
-    ws.send(Message::Binary(Frame::new(1, Packet::Data { payload: b"v1".to_vec() }).encode()))
+    ws.send(Message::Binary(connect.encode().into())).await.unwrap();
+    ws.send(Message::Binary(Frame::new(1, Packet::Data { payload: b"v1".to_vec() }).encode().into()))
         .await
         .unwrap();
     let message = timeout(WAIT, ws.next()).await.unwrap().unwrap().unwrap();
     let frame = Frame::decode(&message.into_data()).unwrap();
     // v1 has no stream open confirmation, so the first thing back is the echo
     assert_eq!(frame, Frame::new(1, Packet::Data { payload: b"v1".to_vec() }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn big_two_way_transfer_does_not_deadlock() {
+    // more data in flight than the kernel socket buffers can hold, in both directions at once.
+    // a proxy that waits on a write before it reads again freezes here.
+    let mux = default_pair().await;
+    let port = tcp_echo_server().await;
+    let data = pattern(64 * 1024 * 1024);
+    let echoed = timeout(Duration::from_secs(60), echo_through(&mux, port, data.clone()))
+        .await
+        .expect("two way transfer froze");
+    assert!(echoed == data);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn many_big_streams_at_once_do_not_deadlock() {
+    // several saturated streams share one websocket in both directions. if either side stops
+    // reading the websocket while it waits to write to it, both sides end up waiting forever.
+    let mux = default_pair().await;
+    let port = tcp_echo_server().await;
+    let mut tasks = Vec::new();
+    for i in 0..8u8 {
+        let mux = mux.clone();
+        tasks.push(tokio::spawn(async move {
+            let data: Vec<u8> = pattern(16 * 1024 * 1024).into_iter().map(|b| b ^ i).collect();
+            let echoed = timeout(Duration::from_secs(60), echo_through(&mux, port, data.clone()))
+                .await
+                .expect("concurrent transfer froze");
+            assert!(echoed == data);
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
 }

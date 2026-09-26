@@ -43,7 +43,12 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let config = client_config(&args)?;
     let connector = Connector::Rustls(Arc::new(tls_config(args.ca_cert.as_deref())?));
     let request = client::request(&args.url)?;
-    let (ws, _) = tokio_tungstenite::connect_async_tls_with_config(request, None, false, Some(connector)).await?;
+    let (ws, _) = tokio_tungstenite::connect_async_tls_with_config(
+        request,
+        Some(wisp_tokio::websocket_config()),
+        false,
+        Some(connector),
+    ).await?;
 
     let mux = ClientMux::new(ws, config).await?;
     if let Some(motd) = &mux.info().motd {

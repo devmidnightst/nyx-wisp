@@ -2,7 +2,8 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
 
-use futures_util::{SinkExt, StreamExt};
+use bytes::Bytes;
+use futures_util::StreamExt;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
@@ -11,19 +12,12 @@ use tokio_tungstenite::WebSocketStream;
 use wisp_core::{CloseReason, Frame, Packet};
 
 use super::Shared;
-use crate::ws::frame_message;
-
-/// Something for the driver task to do.
-#[derive(Debug)]
-pub(crate) enum Command {
-    Frame(Frame),
-    Shutdown,
-}
+use crate::ws::{split_data, write_loop, Outgoing};
 
 /// What a stream's reader sees.
 #[derive(Debug)]
 pub(crate) enum StreamEvent {
-    Data(Vec<u8>),
+    Data(Bytes),
     Closed(CloseReason),
     /// The websocket went away.
     ConnectionLost,
@@ -113,45 +107,38 @@ pub(crate) struct StreamSlot {
 }
 
 pub(crate) async fn run<S>(
-    mut ws: WebSocketStream<S>,
+    ws: WebSocketStream<S>,
     shared: Arc<Shared>,
-    mut out_rx: mpsc::Receiver<Command>,
-    mut ctrl_rx: mpsc::UnboundedReceiver<Command>,
+    mut out_rx: mpsc::Receiver<Outgoing>,
+    mut ctrl_rx: mpsc::UnboundedReceiver<Outgoing>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    loop {
-        tokio::select! {
-            incoming = ws.next() => {
-                match incoming {
-                    Some(Ok(Message::Binary(bytes))) => {
+    let (mut sink, mut incoming) = ws.split();
+
+    let reader = async {
+        loop {
+            match incoming.next().await {
+                // DATA skips the general decoder and keeps its payload in the buffer it arrived in
+                Some(Ok(Message::Binary(bytes))) => match split_data(bytes) {
+                    Ok((stream_id, payload)) => route_data(stream_id, payload, &shared),
+                    Err(bytes) => {
                         if let Ok(frame) = Frame::decode(&bytes) {
                             handle_frame(frame, &shared);
                         }
                     }
-                    Some(Ok(_)) => {}
-                    Some(Err(_)) | None => break,
-                }
-            }
-            // control commands (shutdown, closes from dropped streams when the data queue was
-            // full) have their own unbounded queue so they never wait behind data
-            Some(command) = ctrl_rx.recv() => {
-                if !send_command(&mut ws, command).await {
-                    break;
-                }
-            }
-            command = out_rx.recv() => {
-                // every sender lives in a ClientMux or a WispStream, so once they are all gone
-                // nothing can use this connection any more
-                let Some(command) = command else {
-                    let _ = ws.close(None).await;
-                    break;
-                };
-                if !send_command(&mut ws, command).await {
-                    break;
-                }
+                },
+                Some(Ok(_)) => {}
+                Some(Err(_)) | None => break,
             }
         }
+    };
+
+    // reading and writing run side by side: see write_loop for why they must not take turns.
+    // the writer ends on shutdown, or once every ClientMux and WispStream is gone.
+    tokio::select! {
+        _ = reader => {}
+        _ = write_loop(&mut sink, &mut ctrl_rx, &mut out_rx) => {}
     }
 
     shared.closed.store(true, Ordering::SeqCst);
@@ -165,17 +152,9 @@ pub(crate) async fn run<S>(
     }
 }
 
-/// Sends a command's frame; false once the websocket is unusable or a shutdown was requested.
-async fn send_command<S>(ws: &mut WebSocketStream<S>, command: Command) -> bool
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    match command {
-        Command::Frame(frame) => ws.send(frame_message(&frame)).await.is_ok(),
-        Command::Shutdown => {
-            let _ = ws.close(None).await;
-            false
-        }
+fn route_data(stream_id: u32, payload: Bytes, shared: &Shared) {
+    if let Some(slot) = shared.streams.lock().unwrap().get(&stream_id) {
+        let _ = slot.events.send(StreamEvent::Data(payload));
     }
 }
 
@@ -190,7 +169,7 @@ fn handle_frame(frame: Frame, shared: &Shared) {
 
     match frame.packet {
         Packet::Data { payload } => {
-            let _ = slot.events.send(StreamEvent::Data(payload));
+            let _ = slot.events.send(StreamEvent::Data(Bytes::from(payload)));
         }
         Packet::Continue { buffer_remaining } => {
             slot.flow.on_continue(buffer_remaining);
