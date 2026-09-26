@@ -601,3 +601,230 @@ async fn zero_buffer_size_is_rejected_at_startup() {
     let _ = child.wait();
     panic!("nyx-server started with --buffer-size 0 instead of refusing it");
 }
+
+// stream open confirmation
+
+fn confirmation_ext() -> ExtensionMeta {
+    ExtensionMeta::new(extension_id::STREAM_OPEN_CONFIRMATION, vec![])
+}
+
+async fn established_with(server: &Server, extensions: Vec<ExtensionMeta>) -> (Ws, u32) {
+    let mut ws = ws_connect(server, Some("wisp-v2")).await;
+    match handshake(&mut ws, extensions).await {
+        Packet::Continue { buffer_remaining } => (ws, buffer_remaining),
+        other => panic!("handshake failed: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn server_advertises_stream_confirmation_by_default() {
+    let server = start_server(&[]).await;
+    let mut ws = ws_connect(&server, Some("wisp-v2")).await;
+    let extensions = recv_server_info(&mut ws).await;
+    assert!(extensions
+        .iter()
+        .any(|ext| ext.id == extension_id::STREAM_OPEN_CONFIRMATION));
+
+    let server = start_server(&["--no-stream-confirmation", "--no-udp"]).await;
+    let mut ws = ws_connect(&server, Some("wisp-v2")).await;
+    let extensions = recv_server_info(&mut ws).await;
+    assert!(extensions.is_empty(), "{extensions:?}");
+}
+
+#[tokio::test]
+async fn confirmation_continue_arrives_before_any_data() {
+    let server = start_server(&["--buffer-size", "4"]).await;
+    let echo = tcp_echo_server().await;
+    let (mut ws, window) = established_with(&server, vec![confirmation_ext()]).await;
+    assert_eq!(window, 4);
+
+    send(&mut ws, 3, connect(StreamType::Tcp, "127.0.0.1", echo)).await;
+    match recv_for(&mut ws, 3).await {
+        Packet::Continue { buffer_remaining } => assert_eq!(buffer_remaining, 4),
+        other => panic!("expected the confirmation CONTINUE, got {other:?}"),
+    }
+    send(&mut ws, 3, Packet::Data { payload: b"confirmed".to_vec() }).await;
+    assert_eq!(recv_for(&mut ws, 3).await, Packet::Data { payload: b"confirmed".to_vec() });
+}
+
+#[tokio::test]
+async fn confirmation_window_accounts_for_early_data() {
+    let server = start_server(&["--buffer-size", "4"]).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (mut ws, _) = established_with(&server, vec![confirmation_ext()]).await;
+
+    // three packets go out before the upstream connect can finish, because nothing accepts yet
+    send(&mut ws, 5, connect(StreamType::Tcp, "127.0.0.1", port)).await;
+    for _ in 0..3 {
+        send(&mut ws, 5, Packet::Data { payload: b"early".to_vec() }).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (mut upstream, _) = timeout(WAIT, listener.accept()).await.unwrap().unwrap();
+
+    match recv_for(&mut ws, 5).await {
+        Packet::Continue { buffer_remaining } => {
+            assert!(buffer_remaining <= 4, "window {buffer_remaining} is bigger than the buffer");
+            assert!(buffer_remaining >= 1, "queued packets should not use up the whole window");
+        }
+        other => panic!("expected the confirmation CONTINUE, got {other:?}"),
+    }
+
+    let mut received = vec![0u8; 15];
+    timeout(WAIT, upstream.read_exact(&mut received)).await.unwrap().unwrap();
+    assert_eq!(received, b"earlyearlyearly");
+}
+
+#[tokio::test]
+async fn failed_connect_gets_close_and_no_confirmation() {
+    let server = start_server(&[]).await;
+    let (mut ws, _) = established_with(&server, vec![confirmation_ext()]).await;
+    send(&mut ws, 7, connect(StreamType::Tcp, "127.0.0.1", closed_port())).await;
+    assert_eq!(
+        recv_for(&mut ws, 7).await,
+        Packet::Close { reason: CloseReason::ConnectionRefused }
+    );
+}
+
+#[tokio::test]
+async fn udp_streams_never_get_a_confirmation_continue() {
+    let server = start_server(&[]).await;
+    let echo = udp_echo_server().await;
+    let (mut ws, _) = established_with(&server, vec![ExtensionMeta::new(extension_id::UDP, vec![]), confirmation_ext()]).await;
+    send(&mut ws, 9, connect(StreamType::Udp, "127.0.0.1", echo)).await;
+    send(&mut ws, 9, Packet::Data { payload: b"dgram".to_vec() }).await;
+    // the spec forbids CONTINUE on udp streams, so the echo must be the first thing back
+    assert_eq!(recv_for(&mut ws, 9).await, Packet::Data { payload: b"dgram".to_vec() });
+}
+
+#[tokio::test]
+async fn no_udp_flag_refuses_udp_streams() {
+    let server = start_server(&["--no-udp"]).await;
+    let echo = udp_echo_server().await;
+    let (mut ws, _) = established(&server).await;
+    send(&mut ws, 2, connect(StreamType::Udp, "127.0.0.1", echo)).await;
+    assert_eq!(recv_for(&mut ws, 2).await, Packet::Close { reason: CloseReason::InvalidInfo });
+}
+
+#[tokio::test]
+async fn handshake_timeout_drops_silent_clients() {
+    let server = start_server(&["--handshake-timeout", "1"]).await;
+    let mut ws = ws_connect(&server, Some("wisp-v2")).await;
+    recv_server_info(&mut ws).await;
+    // never send INFO; the server gives up after a second
+    let closed = timeout(Duration::from_secs(4), async {
+        loop {
+            match ws.next().await {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "the server kept waiting for a client that never sent INFO");
+}
+
+// tls
+
+struct TlsFiles {
+    dir: std::path::PathBuf,
+    cert_pem: String,
+}
+
+impl TlsFiles {
+    fn generate() -> TlsFiles {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let dir = std::env::temp_dir().join(format!("nyx-tls-{}-{}", std::process::id(), free_port()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert_pem = cert.cert.pem();
+        std::fs::write(dir.join("cert.pem"), &cert_pem).unwrap();
+        std::fs::write(dir.join("key.pem"), cert.key_pair.serialize_pem()).unwrap();
+        TlsFiles { dir, cert_pem }
+    }
+
+    fn cert(&self) -> String {
+        self.dir.join("cert.pem").display().to_string()
+    }
+
+    fn key(&self) -> String {
+        self.dir.join("key.pem").display().to_string()
+    }
+
+    fn connector(&self) -> tokio_tungstenite::Connector {
+        use tokio_rustls::rustls::pki_types::pem::PemObject;
+        use tokio_rustls::rustls::pki_types::CertificateDer;
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from_pem_slice(self.cert_pem.as_bytes()).unwrap())
+            .unwrap();
+        let config = tokio_rustls::rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(config))
+    }
+}
+
+impl Drop for TlsFiles {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[tokio::test]
+async fn tls_server_speaks_wisp_over_wss() {
+    let files = TlsFiles::generate();
+    let server = start_server(&["--tls-cert", &files.cert(), "--tls-key", &files.key()]).await;
+    let echo = tcp_echo_server().await;
+
+    let mut request = format!("wss://localhost:{}/", server.addr.port())
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("sec-websocket-protocol", HeaderValue::from_static("wisp-v2"));
+    let (mut ws, _) = timeout(
+        WAIT,
+        tokio_tungstenite::connect_async_tls_with_config(request, None, false, Some(files.connector())),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(matches!(handshake(&mut ws, vec![]).await, Packet::Continue { .. }));
+    send(&mut ws, 1, connect(StreamType::Tcp, "127.0.0.1", echo)).await;
+    send(&mut ws, 1, Packet::Data { payload: b"encrypted".to_vec() }).await;
+    assert_eq!(recv_for(&mut ws, 1).await, Packet::Data { payload: b"encrypted".to_vec() });
+}
+
+#[tokio::test]
+async fn tls_server_rejects_plain_websockets() {
+    let files = TlsFiles::generate();
+    let server = start_server(&["--tls-cert", &files.cert(), "--tls-key", &files.key()]).await;
+    let request = format!("ws://{}/", server.addr).into_client_request().unwrap();
+    let result = timeout(WAIT, tokio_tungstenite::connect_async(request)).await.unwrap();
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn tls_flags_must_be_given_together() {
+    let files = TlsFiles::generate();
+    let status = Command::new(env!("CARGO_BIN_EXE_nyx-server"))
+        .args(["--tls-cert", &files.cert()])
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(!status.success());
+}
+
+#[tokio::test]
+async fn bad_tls_files_are_rejected_at_startup() {
+    let files = TlsFiles::generate();
+    // the certificate is not a valid key
+    let status = Command::new(env!("CARGO_BIN_EXE_nyx-server"))
+        .args(["--bind", &format!("127.0.0.1:{}", free_port())])
+        .args(["--tls-cert", &files.cert(), "--tls-key", &files.cert()])
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(!status.success());
+}

@@ -1,19 +1,19 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
-
 use futures_util::{SinkExt, StreamExt};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
 
 use wisp_core::flow_control::ServerFlowControl;
 use wisp_core::{CloseReason, Frame, Packet, StreamType};
 
-use crate::proto::WsStream;
+use super::MuxOptions;
+use crate::ws::frame_message;
 
 // frames produced by stream tasks queue here before hitting the websocket. bounded so a slow
 // websocket pushes back on the upstream sockets instead of buffering without limit.
@@ -38,7 +38,7 @@ struct StreamContext {
 impl StreamContext {
     async fn send(&self, packet: Packet) -> bool {
         self.out_tx
-            .send(Message::Binary(Frame::new(self.stream_id, packet).encode()))
+            .send(frame_message(&Frame::new(self.stream_id, packet)))
             .await
             .is_ok()
     }
@@ -64,7 +64,10 @@ impl StreamContext {
     }
 }
 
-pub async fn run(mut ws: WsStream, buffer_size: u32) {
+pub(crate) async fn run<S>(mut ws: WebSocketStream<S>, options: MuxOptions)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     // replies generated directly by the reader loop, which must never block on its own output
     let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<Message>();
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(OUTBOUND_CAPACITY);
@@ -82,7 +85,7 @@ pub async fn run(mut ws: WsStream, buffer_size: u32) {
                                 &streams,
                                 &ctrl_tx,
                                 &out_tx,
-                                buffer_size,
+                                &options,
                                 &mut next_generation,
                             )
                             .await;
@@ -110,7 +113,22 @@ pub async fn run(mut ws: WsStream, buffer_size: u32) {
 }
 
 fn close_message(stream_id: u32, reason: CloseReason) -> Message {
-    Message::Binary(Frame::new(stream_id, Packet::Close { reason }).encode())
+    frame_message(&Frame::new(stream_id, Packet::Close { reason }))
+}
+
+/// Capacity of a stream's client-to-socket queue. One CONTINUE window, plus a second one when
+/// stream open confirmation is on: the confirmation's CONTINUE can reach the client while packets
+/// it sent under the initial window are still in flight, so up to two windows can be outstanding.
+fn queue_capacity(options: &MuxOptions) -> usize {
+    // tokio's bounded channel panics above usize::MAX >> 3 permits
+    const MAX_CAPACITY: usize = usize::MAX >> 4;
+    let window = options.buffer_size as usize;
+    let capacity = if options.stream_confirmation {
+        window.saturating_mul(2)
+    } else {
+        window
+    };
+    capacity.clamp(1, MAX_CAPACITY)
 }
 
 async fn handle_frame(
@@ -118,7 +136,7 @@ async fn handle_frame(
     streams: &StreamMap,
     ctrl_tx: &mpsc::UnboundedSender<Message>,
     out_tx: &mpsc::Sender<Message>,
-    buffer_size: u32,
+    options: &MuxOptions,
     next_generation: &mut u64,
 ) {
     let stream_id = frame.stream_id;
@@ -136,7 +154,10 @@ async fn handle_frame(
             if guard.contains_key(&stream_id) {
                 return;
             }
-            if destination_hostname.is_empty() || destination_port == 0 {
+            if destination_hostname.is_empty()
+                || destination_port == 0
+                || (stream_type == StreamType::Udp && !options.udp)
+            {
                 let _ = ctrl_tx.send(close_message(stream_id, CloseReason::InvalidInfo));
                 return;
             }
@@ -144,7 +165,7 @@ async fn handle_frame(
             // the stream is registered before the upstream connect finishes, so DATA the client
             // sends early (the spec allows this) is queued instead of dropped, and a slow connect
             // no longer stalls every other stream on this websocket
-            let (to_socket_tx, to_socket_rx) = mpsc::channel::<Vec<u8>>(buffer_size as usize);
+            let (to_socket_tx, to_socket_rx) = mpsc::channel::<Vec<u8>>(queue_capacity(options));
             *next_generation += 1;
             let generation = *next_generation;
             guard.insert(
@@ -170,7 +191,7 @@ async fn handle_frame(
                         destination_hostname,
                         destination_port,
                         to_socket_rx,
-                        buffer_size,
+                        *options,
                     ));
                 }
                 StreamType::Udp => {
@@ -192,8 +213,8 @@ async fn handle_frame(
                 Ok(()) | Err(TrySendError::Closed(_)) => {}
                 // udp is lossy anyway, drop the datagram rather than buffer without limit
                 Err(TrySendError::Full(_)) if handle.stream_type == StreamType::Udp => {}
-                // the queue holds exactly one CONTINUE window, so a full queue means the client
-                // ignored flow control
+                // the queue holds every packet the client may have outstanding, so a full queue
+                // means it ignored flow control
                 Err(TrySendError::Full(_)) => {
                     guard.remove(&stream_id);
                     let _ = ctrl_tx.send(close_message(stream_id, CloseReason::Throttled));
@@ -220,13 +241,10 @@ async fn run_tcp_stream(
     hostname: String,
     port: u16,
     mut to_socket_rx: mpsc::Receiver<Vec<u8>>,
-    buffer_size: u32,
+    options: MuxOptions,
 ) {
-    let connect_result = tokio::time::timeout(
-        Duration::from_secs(10),
-        TcpStream::connect((hostname.as_str(), port)),
-    )
-    .await;
+    let connect_result =
+        tokio::time::timeout(options.connect_timeout, TcpStream::connect((hostname.as_str(), port))).await;
 
     let socket = match connect_result {
         Ok(Ok(socket)) => socket,
@@ -234,11 +252,23 @@ async fn run_tcp_stream(
         Err(_) => return ctx.finish(Some(CloseReason::ConnectionTimedOut)).await,
     };
 
+    // stream open confirmation: tell the client the socket is up. nothing has been written yet,
+    // so whatever the client sent early is still queued and comes off the window it gets back.
+    if options.stream_confirmation {
+        let queued = u32::try_from(to_socket_rx.len()).unwrap_or(u32::MAX);
+        let confirmation = Packet::Continue {
+            buffer_remaining: options.buffer_size.saturating_sub(queued),
+        };
+        if !ctx.send(confirmation).await {
+            return ctx.finish(None).await;
+        }
+    }
+
     let (mut read_half, mut write_half) = socket.into_split();
     let mut read_buf = vec![0u8; 16 * 1024];
     // counted as packets are written out, not as they arrive, so CONTINUE only goes out once
     // the buffer has actually drained
-    let mut flow = ServerFlowControl::new(buffer_size);
+    let mut flow = ServerFlowControl::new(options.buffer_size);
 
     let reason = loop {
         tokio::select! {
@@ -332,4 +362,52 @@ async fn run_udp_stream(
     };
 
     ctx.finish(reason).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn options(buffer_size: u32, stream_confirmation: bool) -> MuxOptions {
+        MuxOptions {
+            buffer_size,
+            udp: true,
+            stream_confirmation,
+            connect_timeout: Duration::from_secs(1),
+        }
+    }
+
+    #[test]
+    fn queue_holds_one_window_without_confirmation() {
+        assert_eq!(queue_capacity(&options(128, false)), 128);
+    }
+
+    #[test]
+    fn queue_holds_two_windows_with_confirmation() {
+        assert_eq!(queue_capacity(&options(128, true)), 256);
+    }
+
+    #[test]
+    fn queue_capacity_is_clamped() {
+        assert_eq!(queue_capacity(&options(0, false)), 1);
+        assert!(queue_capacity(&options(u32::MAX, true)) <= usize::MAX >> 4);
+    }
+
+    #[test]
+    fn io_errors_map_to_close_reasons() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(
+            close_reason_for_io_error(&Error::from(ErrorKind::ConnectionRefused)),
+            CloseReason::ConnectionRefused
+        );
+        assert_eq!(
+            close_reason_for_io_error(&Error::from(ErrorKind::TimedOut)),
+            CloseReason::ConnectionTimedOut
+        );
+        assert_eq!(
+            close_reason_for_io_error(&Error::from(ErrorKind::Other)),
+            CloseReason::HostUnreachable
+        );
+    }
 }
