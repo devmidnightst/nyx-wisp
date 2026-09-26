@@ -5,6 +5,8 @@ use clap::Parser;
 use rand::Rng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 
 use cli::Args;
 use wisp_core::flow_control::ClientFlowControl;
@@ -37,7 +39,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
-    let (mut ws, _) = connect_async(&args.url).await?;
+    // the spec only uses v2 when Sec-WebSocket-Protocol is present, its value is unspecified
+    let mut request = args.url.as_str().into_client_request()?;
+    request
+        .headers_mut()
+        .insert("sec-websocket-protocol", HeaderValue::from_static("wisp-v2"));
+    let (mut ws, _) = connect_async(request).await?;
 
     let negotiated = proto::perform_client_handshake(
         &mut ws,
@@ -144,5 +151,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn parse_target(target: &str) -> Result<(String, u16), Box<dyn std::error::Error>> {
     let (host, port) = target.rsplit_once(':').ok_or("target must be in host:port form")?;
     let port: u16 = port.parse()?;
+    // allow [::1]:80 style ipv6 targets, the brackets are not part of the hostname
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
     Ok((host.to_string(), port))
 }

@@ -23,6 +23,10 @@ pub enum ProtoError {
     ConnectionClosed,
     #[error("unexpected packet received during handshake")]
     UnexpectedHandshakePacket,
+    #[error("server requires authentication but no usable credentials were given")]
+    MissingCredentials,
+    #[error("username must be at most 255 bytes")]
+    UsernameTooLong,
     #[error("server rejected the connection: {0:?}")]
     Rejected(CloseReason),
 }
@@ -70,28 +74,39 @@ pub async fn perform_client_handshake(ws: &mut WsStream, creds: Credentials<'_>)
 
     let mut client_extensions = vec![ExtensionMeta::new(extension_id::UDP, vec![])];
 
+    // if the server marks any auth method as required, sending credentials for any one
+    // offered method is enough, the spec lets the client pick
+    let mut auth_required = false;
+    let mut auth_sent = false;
+
+    if let Some(username) = creds.username {
+        if username.len() > u8::MAX as usize {
+            return Err(ProtoError::UsernameTooLong);
+        }
+    }
+
     if let Some(meta) = server_extensions.iter().find(|extension| extension.id == extension_id::PASSWORD_AUTH) {
         let server_msg = PasswordAuthServer::decode(&meta.data)?;
-        match (creds.username, creds.password) {
-            (Some(username), Some(password)) => {
-                client_extensions.push(ExtensionMeta::new(
-                    extension_id::PASSWORD_AUTH,
-                    PasswordAuthClient {
-                        username: username.to_string(),
-                        password: password.to_string(),
-                    }
-                    .encode(),
-                ));
-            }
-            _ if server_msg.required => return Err(ProtoError::UnexpectedHandshakePacket),
-            _ => {}
+        auth_required |= server_msg.required;
+        if let (Some(username), Some(password)) = (creds.username, creds.password) {
+            auth_sent = true;
+            client_extensions.push(ExtensionMeta::new(
+                extension_id::PASSWORD_AUTH,
+                PasswordAuthClient {
+                    username: username.to_string(),
+                    password: password.to_string(),
+                }
+                .encode(),
+            ));
         }
     }
 
     if let Some(meta) = server_extensions.iter().find(|extension| extension.id == extension_id::KEY_AUTH) {
         let server_msg = KeyAuthServer::decode(&meta.data)?;
+        auth_required |= server_msg.required;
         match creds.key_auth_seed {
-            Some(seed) => {
+            Some(seed) if server_msg.supported_algorithms & SIGNATURE_ALGORITHM_ED25519 != 0 => {
+                auth_sent = true;
                 let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
                 let verifying_key = signing_key.verifying_key();
                 let signature = signing_key.sign(&server_msg.challenge);
@@ -109,9 +124,24 @@ pub async fn perform_client_handshake(ws: &mut WsStream, creds: Credentials<'_>)
                     .encode(),
                 ));
             }
-            None if server_msg.required => return Err(ProtoError::UnexpectedHandshakePacket),
-            None => {}
+            _ => {}
         }
+    }
+
+    if auth_required && !auth_sent {
+        // the spec says a client rejecting the connection must send CLOSE on stream 0 first
+        let _ = send_frame(
+            ws,
+            &Frame::new(
+                0,
+                Packet::Close {
+                    reason: CloseReason::AuthRequired,
+                },
+            ),
+        )
+        .await;
+        let _ = ws.close(None).await;
+        return Err(ProtoError::MissingCredentials);
     }
 
     send_frame(

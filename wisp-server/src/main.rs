@@ -11,6 +11,8 @@ use ed25519_dalek::VerifyingKey;
 use rand::RngCore;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+use tokio_tungstenite::tungstenite::http::HeaderValue;
+use wisp_core::{Frame, Packet};
 
 use auth::{KeyAuthConfig, PasswordAuthConfig};
 use cli::Args;
@@ -72,13 +74,47 @@ async fn handle_connection(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let has_ws_protocol_header = Arc::new(AtomicBool::new(false));
     let flag = has_ws_protocol_header.clone();
-    let mut ws = tokio_tungstenite::accept_hdr_async(socket, move |req: &Request, resp: Response| {
-        flag.store(req.headers().contains_key("sec-websocket-protocol"), Ordering::SeqCst);
+    let mut ws = tokio_tungstenite::accept_hdr_async(socket, move |req: &Request, mut resp: Response| {
+        if let Some(requested) = req.headers().get("sec-websocket-protocol") {
+            flag.store(true, Ordering::SeqCst);
+            // websocket clients fail the upgrade unless the server echoes back one of the
+            // subprotocols they asked for, so pick the first one offered
+            let first = requested
+                .to_str()
+                .ok()
+                .and_then(|value| value.split(',').next())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .and_then(|value| HeaderValue::from_str(value).ok());
+            if let Some(first) = first {
+                resp.headers_mut().insert("sec-websocket-protocol", first);
+            }
+        }
         Ok(resp)
     })
     .await?;
 
     if !has_ws_protocol_header.load(Ordering::SeqCst) {
+        // no Sec-WebSocket-Protocol header means the spec requires wisp v1: no INFO exchange,
+        // just the initial CONTINUE on stream 0. v1 has no way to authenticate, so refuse it
+        // when any auth method is required.
+        let auth_required = password_auth.as_ref().is_some_and(|auth| auth.required)
+            || key_auth.as_ref().is_some_and(|auth| auth.required);
+        if auth_required {
+            let _ = ws.close(None).await;
+            return Ok(());
+        }
+        proto::send_frame(
+            &mut ws,
+            &Frame::new(
+                0,
+                Packet::Continue {
+                    buffer_remaining: buffer_size,
+                },
+            ),
+        )
+        .await?;
+        mux::run(ws, buffer_size).await;
         return Ok(());
     }
 

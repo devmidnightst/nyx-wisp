@@ -122,54 +122,46 @@ pub async fn perform_server_handshake(
         }
     };
 
+    // a client that sends credentials for a method must pass it. if no credentials were sent
+    // at all, the connection is only refused when some method is required, and then with the
+    // dedicated "auth required" reason. when both methods are offered, either one is enough.
+    let mut any_authenticated = false;
+    let mut auth_required = false;
+
     if let Some(password_auth) = config.password_auth {
+        auth_required |= password_auth.required;
         let provided = client_extensions
             .iter()
             .find(|extension| extension.id == extension_id::PASSWORD_AUTH);
-        let authenticated = match provided {
-            Some(meta) => PasswordAuthClient::decode(&meta.data)
+        if let Some(meta) = provided {
+            let valid = PasswordAuthClient::decode(&meta.data)
                 .map(|creds| creds.username == password_auth.username && creds.password == password_auth.password)
-                .unwrap_or(false),
-            None => !password_auth.required,
-        };
-        if !authenticated {
-            let _ = send_frame(
-                ws,
-                &Frame::new(
-                    0,
-                    Packet::Close {
-                        reason: CloseReason::AuthFailedCredentials,
-                    },
-                ),
-            )
-            .await;
-            return Err(ProtoError::AuthFailed);
+                .unwrap_or(false);
+            if !valid {
+                return reject(ws, CloseReason::AuthFailedCredentials).await;
+            }
+            any_authenticated = true;
         }
     }
 
     if let Some((key_auth, challenge)) = config.key_auth {
+        auth_required |= key_auth.required;
         let provided = client_extensions
             .iter()
             .find(|extension| extension.id == extension_id::KEY_AUTH);
-        let authenticated = match provided {
-            Some(meta) => KeyAuthClient::decode(&meta.data)
+        if let Some(meta) = provided {
+            let valid = KeyAuthClient::decode(&meta.data)
                 .map(|msg| key_auth.verify(&msg, challenge))
-                .unwrap_or(false),
-            None => !key_auth.required,
-        };
-        if !authenticated {
-            let _ = send_frame(
-                ws,
-                &Frame::new(
-                    0,
-                    Packet::Close {
-                        reason: CloseReason::AuthFailedSignature,
-                    },
-                ),
-            )
-            .await;
-            return Err(ProtoError::AuthFailed);
+                .unwrap_or(false);
+            if !valid {
+                return reject(ws, CloseReason::AuthFailedSignature).await;
+            }
+            any_authenticated = true;
         }
+    }
+
+    if auth_required && !any_authenticated {
+        return reject(ws, CloseReason::AuthRequired).await;
     }
 
     send_frame(
@@ -186,4 +178,10 @@ pub async fn perform_server_handshake(
     Ok(Negotiated {
         buffer_size: config.buffer_size,
     })
+}
+
+async fn reject(ws: &mut WsStream, reason: CloseReason) -> Result<Negotiated, ProtoError> {
+    let _ = send_frame(ws, &Frame::new(0, Packet::Close { reason })).await;
+    let _ = ws.close(None).await;
+    Err(ProtoError::AuthFailed)
 }
