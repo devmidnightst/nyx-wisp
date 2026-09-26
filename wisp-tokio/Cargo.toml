@@ -1,0 +1,21 @@
+[package]
+name = "wisp-tokio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Async Wisp v2 client and server multiplexers built on tokio and tokio-tungstenite"
+
+[dependencies]
+wisp-core = { path = "../wisp-core" }
+tokio = { version = "1", features = ["rt", "net", "io-util", "macros", "sync", "time"] }
+tokio-util = "0.7"
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+rand = "0.8"
+ed25519-dalek = "2"
+sha2 = "0.10"
+thiserror = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }

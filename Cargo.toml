@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["wisp-core", "wisp-server", "wisp-client"]
+members = ["wisp-core", "wisp-tokio", "wisp-server", "wisp-client"]
 
 [workspace.package]
 version = "0.1.0"

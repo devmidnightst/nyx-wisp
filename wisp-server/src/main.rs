@@ -1,30 +1,57 @@
-mod auth;
 mod cli;
-mod mux;
-mod proto;
+mod tls;
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use ed25519_dalek::VerifyingKey;
-use rand::RngCore;
-use tokio::net::{TcpListener, TcpStream};
-use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+use tokio::net::TcpListener;
 
-use auth::{KeyAuthConfig, PasswordAuthConfig};
+use wisp_tokio::server::{self, KeyAuth, PasswordAuth, ServerConfig};
+
 use cli::Args;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    let config = Arc::new(server_config(&args)?);
+    let tls = match (&args.tls_cert, &args.tls_key) {
+        (Some(cert), Some(key)) => Some(tls::acceptor(cert, key)?),
+        _ => None,
+    };
 
+    let listener = TcpListener::bind(&args.bind).await?;
+    let scheme = if tls.is_some() { "wss" } else { "ws" };
+    println!("nyx-server listening on {scheme}://{}/", listener.local_addr()?);
+
+    loop {
+        let (socket, _) = listener.accept().await?;
+        let config = config.clone();
+        let tls = tls.clone();
+        tokio::spawn(async move {
+            let _ = socket.set_nodelay(true);
+            match tls {
+                Some(tls) => {
+                    if let Ok(socket) = tls.accept(socket).await {
+                        let _ = server::accept(socket, config).await;
+                    }
+                }
+                None => {
+                    let _ = server::accept(socket, config).await;
+                }
+            }
+        });
+    }
+}
+
+fn server_config(args: &Args) -> Result<ServerConfig, Box<dyn std::error::Error>> {
     let password_auth = match (&args.username, &args.password) {
-        (Some(username), Some(password)) => Some(Arc::new(PasswordAuthConfig {
+        (Some(username), Some(password)) => Some(PasswordAuth {
             username: username.clone(),
             password: password.clone(),
             required: !args.password_optional,
-        })),
+        }),
         (None, None) => None,
         _ => return Err("--username and --password must be set together".into()),
     };
@@ -40,65 +67,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|_| "--key-auth-pubkey must be 32 bytes, hex encoded")?;
             allowed_keys.push(VerifyingKey::from_bytes(&bytes)?);
         }
-        Some(Arc::new(KeyAuthConfig {
+        Some(KeyAuth {
             allowed_keys,
             required: !args.key_auth_optional,
-        }))
+        })
     };
 
-    let motd: Option<Arc<str>> = args.motd.clone().map(Arc::from);
-
-    let listener = TcpListener::bind(&args.bind).await?;
-    println!("nyx-server listening on {}", args.bind);
-
-    loop {
-        let (socket, _) = listener.accept().await?;
-        let password_auth = password_auth.clone();
-        let key_auth = key_auth.clone();
-        let motd = motd.clone();
-        let buffer_size = args.buffer_size;
-        tokio::spawn(async move {
-            let _ = handle_connection(socket, buffer_size, password_auth, key_auth, motd).await;
-        });
-    }
-}
-
-async fn handle_connection(
-    socket: TcpStream,
-    buffer_size: u32,
-    password_auth: Option<Arc<PasswordAuthConfig>>,
-    key_auth: Option<Arc<KeyAuthConfig>>,
-    motd: Option<Arc<str>>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let has_ws_protocol_header = Arc::new(AtomicBool::new(false));
-    let flag = has_ws_protocol_header.clone();
-    let mut ws = tokio_tungstenite::accept_hdr_async(socket, move |req: &Request, resp: Response| {
-        flag.store(req.headers().contains_key("sec-websocket-protocol"), Ordering::SeqCst);
-        Ok(resp)
+    Ok(ServerConfig {
+        buffer_size: args.buffer_size,
+        password_auth,
+        key_auth,
+        motd: args.motd.clone(),
+        udp: !args.no_udp,
+        stream_confirmation: !args.no_stream_confirmation,
+        connect_timeout: Duration::from_secs(args.connect_timeout),
+        handshake_timeout: Duration::from_secs(args.handshake_timeout),
     })
-    .await?;
-
-    if !has_ws_protocol_header.load(Ordering::SeqCst) {
-        return Ok(());
-    }
-
-    let challenge = key_auth.as_ref().map(|_| {
-        let mut bytes = vec![0u8; 64];
-        rand::thread_rng().fill_bytes(&mut bytes);
-        bytes
-    });
-
-    let negotiated = proto::perform_server_handshake(
-        &mut ws,
-        proto::HandshakeConfig {
-            buffer_size,
-            password_auth: password_auth.as_deref(),
-            key_auth: key_auth.as_deref().zip(challenge.as_deref()),
-            motd: motd.as_deref(),
-        },
-    )
-    .await?;
-
-    mux::run(ws, negotiated.buffer_size).await;
-    Ok(())
 }
