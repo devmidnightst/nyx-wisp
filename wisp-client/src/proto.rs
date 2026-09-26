@@ -15,8 +15,9 @@ pub type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProtoError {
+    // boxed because tungstenite's error is large enough to bloat every Result that carries it
     #[error(transparent)]
-    WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
+    WebSocket(Box<tokio_tungstenite::tungstenite::Error>),
     #[error(transparent)]
     Wisp(#[from] wisp_core::WispError),
     #[error("connection closed before the handshake completed")]
@@ -31,6 +32,12 @@ pub enum ProtoError {
     Rejected(CloseReason),
 }
 
+impl From<tokio_tungstenite::tungstenite::Error> for ProtoError {
+    fn from(err: tokio_tungstenite::tungstenite::Error) -> Self {
+        ProtoError::WebSocket(Box::new(err))
+    }
+}
+
 pub async fn send_frame(ws: &mut WsStream, frame: &Frame) -> Result<(), ProtoError> {
     ws.send(Message::Binary(frame.encode())).await?;
     Ok(())
@@ -40,7 +47,7 @@ pub async fn recv_frame(ws: &mut WsStream) -> Result<Option<Frame>, ProtoError> 
     loop {
         match ws.next().await {
             None => return Ok(None),
-            Some(Err(err)) => return Err(ProtoError::WebSocket(err)),
+            Some(Err(err)) => return Err(err.into()),
             Some(Ok(Message::Binary(bytes))) => return Ok(Some(Frame::decode(&bytes)?)),
             Some(Ok(Message::Close(_))) => return Ok(None),
             Some(Ok(_)) => continue,
