@@ -12,6 +12,18 @@ mod ws;
 
 pub use error::{Error, Result};
 
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+
 /// The value this crate sends in `Sec-WebSocket-Protocol`. The spec only requires the header to
 /// be present; its value is unspecified.
 pub const WISP_SUBPROTOCOL: &str = "wisp-v2";
+
+/// Websocket settings tuned for wisp traffic. The server uses these for every connection it
+/// accepts; pass them to `tokio_tungstenite`'s `*_with_config` functions when connecting a client.
+///
+/// The only change from tungstenite's defaults is a 16 KiB read buffer instead of 128 KiB.
+/// tungstenite zeroes the whole read buffer before every read, which costs more than the bigger
+/// reads save once most frames are small.
+pub fn websocket_config() -> WebSocketConfig {
+    WebSocketConfig::default().read_buffer_size(16 * 1024)
+}

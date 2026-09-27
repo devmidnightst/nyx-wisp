@@ -19,7 +19,7 @@ hex = "0.4"
 
 [dev-dependencies]
 wisp-core = { path = "../wisp-core" }
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 futures-util = "0.3"
 sha2 = "0.10"

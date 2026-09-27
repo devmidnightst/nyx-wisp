@@ -3,15 +3,17 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 
+use bytes::{Buf, Bytes};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 use tokio_util::sync::PollSender;
 
 use wisp_core::{CloseReason, Frame, Packet, StreamType};
 
-use super::driver::{Command, FlowState, StreamEvent, Window};
+use super::driver::{FlowState, StreamEvent, Window};
 use super::{close_reason_error, Shared};
 use crate::error::{Error, Result};
+use crate::ws::{data_message, frame_message, Outgoing};
 
 /// Largest DATA payload a single `poll_write` sends. Bigger writes are split across packets.
 pub const MAX_DATA_PAYLOAD: usize = 64 * 1024;
@@ -27,12 +29,12 @@ pub struct WispStream {
     token: u64,
     stream_type: StreamType,
     events: mpsc::UnboundedReceiver<StreamEvent>,
-    read_buf: Vec<u8>,
-    read_pos: usize,
+    /// Unread part of the last DATA payload.
+    read_buf: Bytes,
     read_state: ReadState,
     flow: Arc<FlowState>,
-    sender: PollSender<Command>,
-    ctrl_tx: mpsc::UnboundedSender<Command>,
+    sender: PollSender<Outgoing>,
+    ctrl_tx: mpsc::UnboundedSender<Outgoing>,
     shared: Arc<Shared>,
     locally_closed: bool,
 }
@@ -53,8 +55,8 @@ impl WispStream {
         stream_type: StreamType,
         events: mpsc::UnboundedReceiver<StreamEvent>,
         flow: Arc<FlowState>,
-        out_tx: mpsc::Sender<Command>,
-        ctrl_tx: mpsc::UnboundedSender<Command>,
+        out_tx: mpsc::Sender<Outgoing>,
+        ctrl_tx: mpsc::UnboundedSender<Outgoing>,
         shared: Arc<Shared>,
     ) -> Self {
         WispStream {
@@ -62,8 +64,7 @@ impl WispStream {
             token,
             stream_type,
             events,
-            read_buf: Vec::new(),
-            read_pos: 0,
+            read_buf: Bytes::new(),
             read_state: ReadState::Open,
             flow,
             sender: PollSender::new(out_tx),
@@ -103,11 +104,8 @@ impl WispStream {
     /// The next DATA payload from the server, bypassing the `AsyncRead` buffer. `Ok(None)` once
     /// the server closed the stream voluntarily.
     pub async fn recv_packet(&mut self) -> Result<Option<Vec<u8>>> {
-        if self.read_pos < self.read_buf.len() {
-            let rest = self.read_buf.split_off(self.read_pos);
-            self.read_buf.clear();
-            self.read_pos = 0;
-            return Ok(Some(rest));
+        if !self.read_buf.is_empty() {
+            return Ok(Some(std::mem::take(&mut self.read_buf).into()));
         }
         match self.read_state {
             ReadState::Open => {}
@@ -116,7 +114,7 @@ impl WispStream {
             ReadState::ConnectionLost => return Err(Error::MuxClosed),
         }
         match self.events.recv().await {
-            Some(StreamEvent::Data(payload)) => Ok(Some(payload)),
+            Some(StreamEvent::Data(payload)) => Ok(Some(payload.into())),
             Some(StreamEvent::Closed(reason)) => {
                 self.read_state = ReadState::Closed(reason);
                 if reason == CloseReason::Voluntary {
@@ -164,16 +162,14 @@ impl WispStream {
             return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionAborted, Error::MuxClosed)));
         }
         let len = buf.len().min(max_len);
-        let frame = Frame::new(
-            self.stream_id,
-            Packet::Data {
-                payload: buf[..len].to_vec(),
-            },
-        );
-        if self.sender.send_item(Command::Frame(frame)).is_err() {
+        let message = data_message(self.stream_id, &buf[..len]);
+        // take the window slot before the packet is queued. taking it after races the server:
+        // its CONTINUE for this very packet can arrive and reset the window first, and the late
+        // decrement then leaves the window one short for good, which eventually stalls writes.
+        self.flow.consume();
+        if self.sender.send_item(Outgoing::Message(message)).is_err() {
             return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionAborted, Error::MuxClosed)));
         }
-        self.flow.consume();
         Poll::Ready(Ok(len))
     }
 
@@ -182,12 +178,11 @@ impl WispStream {
         while self.read_state == ReadState::Open {
             match self.events.try_recv() {
                 Ok(StreamEvent::Data(payload)) => {
-                    if self.read_pos >= self.read_buf.len() {
-                        self.read_buf = payload;
-                        self.read_pos = 0;
+                    self.read_buf = if self.read_buf.is_empty() {
+                        payload
                     } else {
-                        self.read_buf.extend_from_slice(&payload);
-                    }
+                        [&self.read_buf[..], &payload[..]].concat().into()
+                    };
                 }
                 Ok(StreamEvent::Closed(reason)) => self.read_state = ReadState::Closed(reason),
                 Ok(StreamEvent::ConnectionLost) => self.read_state = ReadState::ConnectionLost,
@@ -207,7 +202,7 @@ impl WispStream {
         }
         if ready!(self.sender.poll_reserve(cx)).is_ok() {
             let close = Frame::new(self.stream_id, Packet::Close { reason });
-            let _ = self.sender.send_item(Command::Frame(close));
+            let _ = self.sender.send_item(Outgoing::Message(frame_message(&close)));
         }
         self.locally_closed = true;
         self.flow.close();
@@ -219,15 +214,10 @@ impl AsyncRead for WispStream {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         let this = &mut *self;
         loop {
-            if this.read_pos < this.read_buf.len() {
-                let available = &this.read_buf[this.read_pos..];
-                let len = available.len().min(buf.remaining());
-                buf.put_slice(&available[..len]);
-                this.read_pos += len;
-                if this.read_pos == this.read_buf.len() {
-                    this.read_buf.clear();
-                    this.read_pos = 0;
-                }
+            if !this.read_buf.is_empty() {
+                let len = this.read_buf.len().min(buf.remaining());
+                buf.put_slice(&this.read_buf[..len]);
+                this.read_buf.advance(len);
                 return Poll::Ready(Ok(()));
             }
 
@@ -242,10 +232,7 @@ impl AsyncRead for WispStream {
             }
 
             match ready!(this.events.poll_recv(cx)) {
-                Some(StreamEvent::Data(payload)) => {
-                    this.read_buf = payload;
-                    this.read_pos = 0;
-                }
+                Some(StreamEvent::Data(payload)) => this.read_buf = payload,
                 Some(StreamEvent::Closed(reason)) => this.read_state = ReadState::Closed(reason),
                 Some(StreamEvent::ConnectionLost) | None => this.read_state = ReadState::ConnectionLost,
             }
@@ -288,9 +275,9 @@ impl Drop for WispStream {
             let queued = self
                 .sender
                 .get_ref()
-                .is_some_and(|sender| sender.try_send(Command::Frame(close.clone())).is_ok());
+                .is_some_and(|sender| sender.try_send(Outgoing::Message(frame_message(&close))).is_ok());
             if !queued {
-                let _ = self.ctrl_tx.send(Command::Frame(close));
+                let _ = self.ctrl_tx.send(Outgoing::Message(frame_message(&close)));
             }
         }
     }

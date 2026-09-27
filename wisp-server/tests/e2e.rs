@@ -77,7 +77,7 @@ async fn ws_connect(server: &Server, subprotocol: Option<&'static str>) -> Ws {
 }
 
 async fn send(ws: &mut Ws, stream_id: u32, packet: Packet) {
-    ws.send(Message::Binary(Frame::new(stream_id, packet).encode()))
+    ws.send(Message::Binary(Frame::new(stream_id, packet).encode().into()))
         .await
         .unwrap();
 }
@@ -415,7 +415,7 @@ async fn frames_on_unknown_streams_are_ignored() {
 
     send(&mut ws, 40, Packet::Data { payload: b"nobody home".to_vec() }).await;
     send(&mut ws, 41, Packet::Close { reason: CloseReason::Voluntary }).await;
-    ws.send(Message::Binary(vec![0xff, 1, 2])).await.unwrap();
+    ws.send(Message::Binary(vec![0xff, 1, 2].into())).await.unwrap();
 
     // the connection must still work afterwards
     send(&mut ws, 42, connect(StreamType::Tcp, "127.0.0.1", echo)).await;
